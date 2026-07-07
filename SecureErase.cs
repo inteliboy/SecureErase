@@ -94,6 +94,10 @@ internal static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern int FormatMessageW(uint dwFlags, IntPtr lpSource, uint dwMessageId,
+        uint dwLanguageId, System.Text.StringBuilder lpBuffer, int nSize, IntPtr Arguments);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr VirtualAlloc(IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
 
@@ -464,6 +468,13 @@ internal static class Program
             return 3;
         }
 
+        if (n == sysDisk && !IsWinPE())
+        {
+            Console.WriteLine("WARNING: this is the running-OS disk on a live Windows system.");
+            Console.WriteLine("         Windows will block the erase. Boot WinPE to wipe it. Continuing anyway...");
+            Console.WriteLine();
+        }
+
         Console.WriteLine("*** THIS WILL PERMANENTLY DESTROY ALL DATA ON DISK " + n + ". ***");
         if (!skipPrompt)
         {
@@ -477,16 +488,21 @@ internal static class Program
             }
         }
 
+        int rc;
         if (di.Bus == BusKind.Nvme)
-            return EraseNvme(n, nsid, crypto);
+            rc = EraseNvme(n, nsid, crypto);
+        else if (di.Bus == BusKind.Sata || di.Bus == BusKind.Ata)
+            rc = EraseAta(n, di, password, enhanced);
+        else
+        {
+            // Fallback: try ATA (some controllers report generically).
+            Console.Error.WriteLine("Bus type '" + di.BusName() + "' is not directly supported.");
+            Console.Error.WriteLine("Attempting ATA security erase anyway...");
+            rc = EraseAta(n, di, password, enhanced);
+        }
 
-        if (di.Bus == BusKind.Sata || di.Bus == BusKind.Ata)
-            return EraseAta(n, di, password, enhanced);
-
-        // Fallback: try ATA first (some controllers report generically), else give up.
-        Console.Error.WriteLine("Bus type '" + di.BusName() + "' is not directly supported.");
-        Console.Error.WriteLine("Attempting ATA security erase anyway...");
-        return EraseAta(n, di, password, enhanced);
+        if (rc != 0 && n == sysDisk && !IsWinPE()) PrintLiveOsDiskHelp();
+        return rc;
     }
 
     // ------------------------------------------------------- annihilation
@@ -510,6 +526,14 @@ internal static class Program
         Console.WriteLine();
 
         int sysDisk = TryGetSystemDiskNumber();
+        bool livePe = !IsWinPE();
+        if (includeSystem && livePe)
+        {
+            Console.WriteLine("WARNING: --include-system on a LIVE Windows system: the running-OS disk");
+            Console.WriteLine("         cannot be erased in place and will report a failure. Only a WinPE");
+            Console.WriteLine("         (or other boot media) session can wipe the OS disk.");
+            Console.WriteLine();
+        }
         List<DiskInfo> targets = new List<DiskInfo>();
         List<string> skipped = new List<string>();
 
@@ -569,7 +593,7 @@ internal static class Program
                 Console.Error.WriteLine("  EXCEPTION on disk " + di.Number + ": " + ex.Message);
                 rc = 99;
             }
-            if (rc != 0) { failCount++; Console.WriteLine(); continue; }
+            if (rc != 0) { failCount++; if (di.Number == sysDisk && livePe) PrintLiveOsDiskHelp(); Console.WriteLine(); continue; }
 
             // Automatic basic-mode verification (sampled raw read).
             long vz, vo, vd, ve;
@@ -714,13 +738,15 @@ internal static class Program
             if (!ok)
             {
                 int w32 = Marshal.GetLastWin32Error();
-                Console.Error.WriteLine("NVMe Format failed. IOCTL win32-err=" + w32 +
+                Console.Error.WriteLine("NVMe Format failed. IOCTL error: " + Win32Text(w32) +
                                         ", protocol ReturnStatus=0x" + status.ToString("X8") +
                                         ", ErrorCode=0x" + errCode.ToString("X8") + ".");
                 if (w32 == 87)
                     Console.Error.WriteLine("(err 87 = the driver rejected the request: this controller/driver may block Format-NVM pass-through, or the namespace has mounted volumes. Try --all-namespaces, dismount volumes, or use the drive vendor's tool.)");
                 else if (w32 == 1 || w32 == 50)
                     Console.Error.WriteLine("(this Windows/WinPE build does not expose IOCTL_STORAGE_PROTOCOL_COMMAND for NVMe.)");
+                else if (w32 == 5 || w32 == 19 || w32 == 32 || w32 == 33)
+                    Console.Error.WriteLine("(the drive/namespace is in use or write-protected; dismount its volumes or run from WinPE.)");
                 else
                     Console.Error.WriteLine("Some controllers/drivers reject this IOCTL; a vendor tool may be required.");
                 return 9;
@@ -1087,6 +1113,42 @@ internal static class Program
     {
         b[o] = (byte)(v & 0xFF); b[o + 1] = (byte)((v >> 8) & 0xFF);
         b[o + 2] = (byte)((v >> 16) & 0xFF); b[o + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    // True if running inside WinPE (destructive erase of internal disks is safe here).
+    private static bool IsWinPE()
+    {
+        try
+        {
+            using (Microsoft.Win32.RegistryKey k =
+                Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\MiniNT"))
+            {
+                return k != null;
+            }
+        }
+        catch { return false; }
+    }
+
+    private static string Win32Text(int code)
+    {
+        try
+        {
+            StringBuilder sb = new StringBuilder(512);
+            Native.FormatMessageW(0x00001000u | 0x00000200u, IntPtr.Zero, (uint)code, 0, sb, sb.Capacity, IntPtr.Zero);
+            string s = sb.ToString().Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length > 0 ? (s + " (err " + code + ")") : ("err " + code);
+        }
+        catch { return "err " + code; }
+    }
+
+    // Explains the one situation that cannot work: erasing the live OS disk in place.
+    private static void PrintLiveOsDiskHelp()
+    {
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("This is the disk hosting the RUNNING Windows. It cannot be erased while");
+        Console.Error.WriteLine("Windows is running from it - the OS locks its boot/system/pagefile volumes,");
+        Console.Error.WriteLine("so the storage stack refuses any destructive Format/Erase against it.");
+        Console.Error.WriteLine("Boot WinPE (or any other media) and erase this disk from there.");
     }
 
     private static bool HasFlag(string[] args, string flag)
