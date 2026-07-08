@@ -27,7 +27,7 @@
   - **SATA / ATA SSDs** → `ATA SECURITY ERASE UNIT` (normal or enhanced)
   - **NVMe SSDs** → `Format NVM` (user-data or cryptographic erase)
 - 🔍 **Built-in verification** — reads the raw media (bypassing the OS cache) and reports whether it comes back blank.
-- 💥 **Annihilation mode** — securely wipe **all internal drives** unattended, each auto-verified.
+- 💥 **Annihilation mode** — securely wipe **all internal drives** unattended, each auto-verified, with **automatic NVMe crypto-erase escalation** when a user-data erase leaves residual data.
 - 🛟 **Recovery commands** — unlock or clear a stuck ATA password if an erase is interrupted.
 - 🧊 **Frozen-state detection** — tells you when the BIOS froze the drive and how to fix it.
 - 🪶 **Tiny & self-contained** — one `.cs` file, compiles with the in-box `csc.exe`. Perfect for a WinPE image.
@@ -189,6 +189,26 @@ SecureErase.exe erase --annihilation
 5. Erases each drive with the right method, then **auto-runs a basic verification**.
 6. Prints `X erased+verified, Y failed/suspect` and returns a non-zero exit code on any failure.
 
+### 🔁 Automatic NVMe crypto-erase escalation
+
+In annihilation mode, NVMe drives use a **two-stage** strategy so that drives which don't
+zero-fill on a user-data `Format` are still reliably wiped:
+
+1. **User-data erase** (`SES=1`) is issued, then verified by a sampled raw read.
+2. If the drive **reads blank**, it passes — done.
+3. If **residual data remains** (or the erase couldn't be completed/verified), SecureErase
+   **escalates to a cryptographic erase** (`SES=2`) — provided the controller reports crypto-erase
+   support in its `FNA` field.
+4. A crypto erase that **completes successfully is treated as success without requiring a blank
+   read-back**, because destroying the media-encryption key makes the old data unrecoverable even
+   if the flash still returns non-zero bytes.
+5. If the controller does **not** support crypto erase (or the crypto `Format` fails), the drive is
+   reported as **failed/suspect** rather than silently passed.
+
+This escalation is **annihilation-only**. The single-disk `erase <disk>` command always does exactly
+what you ask: it honors `--crypto` / `--user` and does not auto-escalate. ATA/SATA drives are erased
+in a single pass and then verified as before.
+
 > In WinPE the "running-OS disk" is the RAM/boot media — so your internal Windows disk **is** still
 > targeted. The exclusion protects the device you booted from, not the drives you mean to wipe.
 
@@ -198,6 +218,9 @@ SecureErase.exe erase --annihilation
 - **eSATA / Thunderbolt** drives may report as *internal* — annihilation lists every target; physically verify first.
 - **Interrupted ATA erase** can leave a drive password-locked → recover with `disablepw`.
 - A sampled verify is statistical evidence, not proof of every sector — use `--full` for formal decommissioning.
+- **NVMe crypto erase is verified by design, not by read-back.** When a drive is confirmed erased via
+  the crypto-escalation path, "success" means the media key was destroyed — a raw read may still show
+  non-zero bytes. Use `--full` read-back only for the user-data / ATA cases where zeroed reads are expected.
 - Provided **as-is, no warranty**. Test on a scratch drive before trusting it on anything that matters.
 
 ## 📄 License

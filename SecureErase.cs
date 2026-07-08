@@ -580,13 +580,102 @@ internal static class Program
         {
             Console.WriteLine("------------------------------------------------------------");
             Console.WriteLine(string.Format("Erasing disk {0}: {1} (SN:{2})", di.Number, di.Model, di.Serial));
+
+            // NVMe escalation (annihilation only): try a user-data erase first,
+            // verify by sampled read; if residual data remains, escalate to a
+            // cryptographic erase (if the controller supports it). A crypto erase
+            // destroys the media key, so the old data is unrecoverable even
+            // though the flash may still read non-zero - therefore a crypto erase
+            // whose Format command SUCCEEDS is treated as success without
+            // requiring a blank read-back. ATA drives keep the single-pass path.
+            if (di.Bus == BusKind.Nvme)
+            {
+                // Honor an explicit --crypto: go straight to crypto erase.
+                if (crypto)
+                {
+                    int rcc0;
+                    try { rcc0 = EraseNvme(di.Number, nvmeNsid, true); }
+                    catch (Exception ex)
+                    { Console.Error.WriteLine("  EXCEPTION on disk " + di.Number + ": " + ex.Message); rcc0 = 99; }
+                    if (rcc0 == 0)
+                    {
+                        Console.WriteLine("  CRYPTO ERASE succeeded (key destroyed) - treated as success.");
+                        okCount++;
+                    }
+                    else { failCount++; }
+                    Console.WriteLine();
+                    continue;
+                }
+
+                // 1) user-data erase (SES=1)
+                int rcu;
+                try { rcu = EraseNvme(di.Number, nvmeNsid, false); }
+                catch (Exception ex)
+                { Console.Error.WriteLine("  EXCEPTION on disk " + di.Number + ": " + ex.Message); rcu = 99; }
+
+                bool verifiedBlank = false;
+                if (rcu == 0)
+                {
+                    long uz, uo, ud, ue;
+                    if (VerifyDisk(di, 256, false, false, out uz, out uo, out ud, out ue))
+                    {
+                        long chk = uz + uo + ud + ue;
+                        if (ud == 0 && chk > 0)
+                        {
+                            Console.WriteLine(string.Format("  VERIFY PASS: {0} sampled blocks read blank.", chk));
+                            verifiedBlank = true;
+                        }
+                        else
+                        {
+                            Console.WriteLine(string.Format("  User-data erase left residual data in {0}/{1} sampled blocks - escalating to crypto erase.", ud, chk));
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("  VERIFY SKIPPED: could not re-open drive to read back.");
+                        // Can't verify; escalate to crypto to be safe.
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("  User-data erase did not complete - escalating to crypto erase.");
+                }
+
+                if (verifiedBlank) { okCount++; Console.WriteLine(); continue; }
+
+                // 2) escalate to crypto erase (SES=2) if supported.
+                if (!NvmeSupportsCrypto(di.Number))
+                {
+                    Console.Error.WriteLine("  CRYPTO ERASE unavailable (controller does not report FNA crypto support). Disk NOT confirmed erased.");
+                    failCount++;
+                    Console.WriteLine();
+                    continue;
+                }
+
+                int rcc;
+                try { rcc = EraseNvme(di.Number, nvmeNsid, true); }
+                catch (Exception ex)
+                { Console.Error.WriteLine("  EXCEPTION on disk " + di.Number + ": " + ex.Message); rcc = 99; }
+
+                if (rcc == 0)
+                {
+                    Console.WriteLine("  CRYPTO ERASE succeeded (media key destroyed) - data is unrecoverable. Treated as success (read-back not applicable).");
+                    okCount++;
+                }
+                else
+                {
+                    Console.Error.WriteLine("  CRYPTO ERASE failed. Disk NOT confirmed erased.");
+                    failCount++;
+                }
+                Console.WriteLine();
+                continue;
+            }
+
+            // ---- ATA path (single pass + verify) ----
             int rc;
             try
             {
-                if (di.Bus == BusKind.Nvme)
-                    rc = EraseNvme(di.Number, nvmeNsid, crypto);
-                else
-                    rc = EraseAta(di.Number, di, password, enhanced && di.EnhancedEraseSupported);
+                rc = EraseAta(di.Number, di, password, enhanced && di.EnhancedEraseSupported);
             }
             catch (Exception ex)
             {
@@ -603,11 +692,6 @@ internal static class Program
                 if (vd == 0 && chk > 0)
                 {
                     Console.WriteLine(string.Format("  VERIFY PASS: {0} sampled blocks read blank.", chk));
-                    okCount++;
-                }
-                else if (di.Bus == BusKind.Nvme && crypto)
-                {
-                    Console.WriteLine(string.Format("  VERIFY: {0}/{1} sampled blocks non-blank - expected for crypto erase (key destroyed).", vd, chk));
                     okCount++;
                 }
                 else
@@ -707,6 +791,21 @@ internal static class Program
             Console.WriteLine("SUCCESS: ATA secure erase completed. Drive security is auto-disabled after erase.");
             RefreshDiskProperties(h);
             return 0;
+        }
+        finally { Native.CloseHandle(h); }
+    }
+
+    // Returns true if the NVMe controller reports support for cryptographic
+    // erase in the FNA (Format NVM Attributes) field of Identify Controller.
+    private static bool NvmeSupportsCrypto(int n)
+    {
+        IntPtr h = OpenDisk(n);
+        if (h == Native.INVALID_HANDLE_VALUE) return false;
+        try
+        {
+            byte[] idctrl = NvmeIdentify(h, 1 /*CNS controller*/, 0);
+            if (idctrl == null) return false;
+            return (idctrl[524] & 0x04) != 0; // FNA bit 2 = crypto erase supported
         }
         finally { Native.CloseHandle(h); }
     }
